@@ -94,8 +94,8 @@ const vertexShader = /* glsl */ `
 
   void main(){
     vec3 pos = position;
-    // tempo follows the music a little: louder = faster flow
-    float t = uTime * (0.06 + uLevel * 0.05);
+    // uTime is a bounded flow clock (advanced per frame), not raw elapsed seconds
+    float t = uTime;
 
     vec3 flow = curlNoise(pos * 0.16 + vec3(0.0, 0.0, t));
     float amp = 1.1 + aSeed.x * 0.9;
@@ -329,8 +329,9 @@ export default function Notchster() {
     // --- audio: smoothed level + bass, from mic or a synthesized beat ---
     let smoothLevel = 0;
     let smoothBass = 0;
+    let beatPhase = 0; // separate clock for the synth groove (never uses wall elapsedTime)
 
-    const sampleAudio = (t: number, dt: number) => {
+    const sampleAudio = (dt: number) => {
       let level = 0;
       let bass = 0;
       const analyser = analyserRef.current;
@@ -349,39 +350,56 @@ export default function Notchster() {
         bass = Math.min(1, bass * 1.4);
       } else {
         // synthesized groove (~112 BPM): a decaying kick + a softer off-beat
-        const bps = 112 / 60;
-        const phase = (t * bps) % 1;
-        const kick = Math.exp(-phase * 6.0);
-        const off = Math.exp(-(((phase + 0.5) % 1) * 8.0)) * 0.5;
+        beatPhase = (beatPhase + dt * (112 / 60)) % 1;
+        const kick = Math.exp(-beatPhase * 6.0);
+        const off = Math.exp(-(((beatPhase + 0.5) % 1) * 8.0)) * 0.5;
         bass = Math.min(1, kick + off * 0.4);
-        level = 0.16 + 0.45 * kick + 0.12 * (0.5 + 0.5 * Math.sin(t * 5.3));
+        // synth is already smooth — use it directly so level can't ratchet upward
+        level = 0.16 + 0.45 * kick + 0.12 * (0.5 + 0.5 * Math.sin(beatPhase * 6.2831 * 2));
       }
-      // attack fast, release slow for a natural pump
-      const upL = 1 - Math.pow(0.0001, dt);
-      const dnL = 1 - Math.pow(0.2, dt);
-      smoothLevel += (level - smoothLevel) * (level > smoothLevel ? upL : dnL);
-      smoothBass += (bass - smoothBass) * (bass > smoothBass ? 1 - Math.pow(0.00001, dt) : 1 - Math.pow(0.12, dt));
-      return { level: smoothLevel, bass: smoothBass };
+      // attack fast, release slow for mic input only
+      if (micOnRef.current) {
+        const upL = 1 - Math.pow(0.0001, dt);
+        const dnL = 1 - Math.pow(0.2, dt);
+        smoothLevel += (level - smoothLevel) * (level > smoothLevel ? upL : dnL);
+        smoothBass +=
+          (bass - smoothBass) *
+          (bass > smoothBass ? 1 - Math.pow(0.00001, dt) : 1 - Math.pow(0.12, dt));
+      } else {
+        smoothLevel = level;
+        smoothBass = bass;
+      }
+      return {
+        level: Math.min(1, Math.max(0, smoothLevel)),
+        bass: Math.min(1, Math.max(0, smoothBass)),
+      };
     };
 
     const clock = new THREE.Clock();
+    let flowTime = 0; // bounded animation clock (advanced per frame, not wall time)
+    let spinY = 0;
+    let spinX = 0;
+    let ambientT = 0;
     let raf = 0;
     const render = () => {
       const dt = Math.min(clock.getDelta(), 0.05);
-      const t = clock.elapsedTime;
-      uniforms.uTime.value = t;
+      ambientT += dt;
 
-      const { level, bass } = sampleAudio(t, dt);
+      const { level, bass } = sampleAudio(dt);
+      // flow speed scales with energy but stays capped — never multiplies raw elapsed time
+      flowTime += dt * (0.06 + level * 0.04);
+      uniforms.uTime.value = flowTime;
       uniforms.uLevel.value = level;
       uniforms.uBass.value = bass;
 
       targetForce *= Math.pow(0.04, dt);
       if (!active) {
         targetMouse.set(
-          Math.cos(t * 0.25) * vHeight * 0.35,
-          Math.sin(t * 0.21) * vHeight * 0.28
+          Math.cos(ambientT * 0.25) * vHeight * 0.35,
+          Math.sin(ambientT * 0.21) * vHeight * 0.28
         );
-        targetForce = Math.max(targetForce, 1.2);
+        // gentle ambient motion only — don't force a permanent high push strength
+        targetForce = Math.max(targetForce, 0.35);
       }
 
       smoothMouse.lerp(targetMouse, 1 - Math.pow(0.0015, dt));
@@ -389,9 +407,11 @@ export default function Notchster() {
       uniforms.uMouseForce.value +=
         (targetForce - uniforms.uMouseForce.value) * (1 - Math.pow(0.02, dt));
 
-      // field spins a touch faster with energy; camera pumps in on the bass
-      points.rotation.y = Math.sin(t * 0.06) * 0.12 + t * (0.01 + level * 0.04);
-      points.rotation.x = Math.cos(t * 0.05) * 0.06;
+      // integrate spin per frame so angular velocity stays bounded
+      spinY += dt * (0.012 + level * 0.028);
+      spinX = Math.cos(ambientT * 0.05) * 0.06;
+      points.rotation.y = Math.sin(ambientT * 0.06) * 0.12 + spinY;
+      points.rotation.x = spinX;
       const targetZ = 24 - bass * 3.2;
       camera.position.x += (smoothMouse.x * 0.04 - camera.position.x) * 0.02;
       camera.position.y += (smoothMouse.y * 0.04 - camera.position.y) * 0.02;
