@@ -152,13 +152,32 @@ export default function Notchster() {
   const mountRef = useRef<HTMLDivElement>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const freqRef = useRef<Uint8Array | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const ctxRef = useRef<AudioContext | null>(null);
   const [micState, setMicState] = useState<"off" | "on" | "error">("off");
 
   // expose latest mic-state to the render loop without re-running the effect
   const micOnRef = useRef(false);
   micOnRef.current = micState === "on";
 
-  const enableMic = async () => {
+  // release the mic + tear down the audio graph (back to the synth beat)
+  const stopMic = () => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (ctxRef.current) {
+      void ctxRef.current.close();
+      ctxRef.current = null;
+    }
+    analyserRef.current = null;
+    freqRef.current = null;
+  };
+
+  const toggleMic = async () => {
+    if (micState === "on") {
+      stopMic();
+      setMicState("off");
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const Ctx =
@@ -172,6 +191,8 @@ export default function Notchster() {
       analyser.fftSize = 1024;
       analyser.smoothingTimeConstant = 0.82;
       source.connect(analyser);
+      streamRef.current = stream;
+      ctxRef.current = ctx;
       analyserRef.current = analyser;
       freqRef.current = new Uint8Array(analyser.frequencyBinCount);
       setMicState("on");
@@ -179,6 +200,9 @@ export default function Notchster() {
       setMicState("error");
     }
   };
+
+  // make sure the mic is released if the page unmounts while listening
+  useEffect(() => stopMic, []);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -440,20 +464,24 @@ export default function Notchster() {
 
           <button
             type="button"
-            onClick={enableMic}
-            disabled={micState === "on"}
-            className="pointer-events-auto mt-9 rounded-full border border-accent/40 bg-accent/10 px-6 py-3 font-mono text-xs uppercase tracking-[0.15em] text-accent backdrop-blur-sm transition-all hover:border-accent/70 hover:bg-accent/20 disabled:cursor-default disabled:border-white/15 disabled:bg-white/5 disabled:text-white/50"
+            onClick={toggleMic}
+            aria-pressed={micState === "on"}
+            className={`pointer-events-auto mt-9 rounded-full border px-6 py-3 font-mono text-xs uppercase tracking-[0.15em] backdrop-blur-sm transition-all ${
+              micState === "on"
+                ? "border-accent bg-accent/20 text-accent hover:bg-accent/30"
+                : "border-accent/40 bg-accent/10 text-accent hover:border-accent/70 hover:bg-accent/20"
+            }`}
           >
             {micState === "on"
-              ? "● listening — make some noise"
+              ? "● mic on — tap to turn off"
               : micState === "error"
-                ? "mic blocked — check permissions"
-                : "▶ react to your sound"}
+                ? "mic blocked — tap to retry"
+                : "▶ turn on mic"}
           </button>
           <p className="mt-3 font-mono text-[0.65rem] uppercase tracking-[0.15em] text-white/30">
             {micState === "on"
-              ? "the field is reacting to your audio"
-              : "running on a synth beat · tap to use your mic"}
+              ? "reacting to your audio — make some noise"
+              : "running on a synth beat · turn on the mic to react to sound"}
           </p>
         </div>
 
