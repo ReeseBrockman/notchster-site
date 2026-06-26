@@ -18,14 +18,14 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://notchster.vercel.app"),
-  title: "Notchster — your notch, but cuter",
+  metadataBase: new URL("https://notchster-site.vercel.app"),
+  title: "Notchster — live visuals for the stage",
   description:
-    "A playful macOS menu-bar companion. A little ASCII bunny drops from your notch with weather, music, system stats, and on-device AI.",
+    "A live-visuals instrument for musicians and DJs. Perform your own reactive visuals straight from your Mac. Coming soon.",
   openGraph: {
-    title: "Notchster — your notch, but cuter",
+    title: "Notchster — live visuals for the stage",
     description:
-      "A playful macOS menu-bar companion. Weather, music, system stats, and on-device AI, wrapped around a charming ASCII bunny that drops from your notch.",
+      "A live-visuals instrument for musicians and DJs. Perform your own reactive visuals straight from your Mac. Coming soon.",
     images: ["/icon.png"],
     type: "website",
   },

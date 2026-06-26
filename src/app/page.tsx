@@ -1,597 +1,469 @@
 "use client";
 
-import { motion, type Variants } from "framer-motion";
-import type { PointerEvent } from "react";
+import { useEffect, useRef, useState } from "react";
+import * as THREE from "three";
 
-const DOWNLOAD_URL = "https://github.com/ReeseBrockman/rabbitOS/releases/latest";
-const SOURCE_URL = "https://github.com/ReeseBrockman/rabbitOS";
+// ---------------------------------------------------------------------------
+// Notchster — teaser for a live-visuals instrument for musicians & DJs.
+// A GPU particle field flowing through a curl-noise velocity field, driven by
+// sound: it breathes on the beat and flares toward white on loud passages.
+// Runs on a synthesized beat by default; tap the button to drive it with the
+// microphone. Three.js + GLSL.
+// ---------------------------------------------------------------------------
 
-const BUNNY = ` (\\_/)
- (o.o)
- (")_(")`;
+const vertexShader = /* glsl */ `
+  uniform float uTime;
+  uniform vec2  uMouse;
+  uniform float uMouseForce;
+  uniform float uSize;
+  uniform float uPixelRatio;
+  uniform float uLevel;   // overall loudness 0..1
+  uniform float uBass;    // low-end energy 0..1
 
-const fadeUp: Variants = {
-  hidden: { opacity: 0, y: 24 },
-  show: (i: number = 0) => ({
-    opacity: 1,
-    y: 0,
-    transition: { duration: 0.6, delay: i * 0.08, ease: [0.16, 1, 0.3, 1] },
-  }),
-};
+  attribute float aScale;
+  attribute vec3  aSeed;
 
-const themeSwatches = [
-  { name: "Blue", c: "#5ea2ff" },
-  { name: "Red", c: "#ff5c5c" },
-  { name: "Green", c: "#4dcc73" },
-  { name: "Purple", c: "#a06bff" },
-  { name: "Orange", c: "#ff9f43" },
-  { name: "Pink", c: "#ff6fae" },
-];
+  varying float vGlow;
 
-function handleSpot(e: PointerEvent<HTMLElement>) {
-  const el = e.currentTarget;
-  const r = el.getBoundingClientRect();
-  el.style.setProperty("--mx", `${((e.clientX - r.left) / r.width) * 100}%`);
-  el.style.setProperty("--my", `${((e.clientY - r.top) / r.height) * 100}%`);
-}
+  vec4 permute(vec4 x){ return mod(((x*34.0)+1.0)*x, 289.0); }
+  vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314 * r; }
+  float snoise(vec3 v){
+    const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+    const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+    vec3 i  = floor(v + dot(v, C.yyy));
+    vec3 x0 = v - i + dot(i, C.xxx);
+    vec3 g = step(x0.yzx, x0.xyz);
+    vec3 l = 1.0 - g;
+    vec3 i1 = min(g.xyz, l.zxy);
+    vec3 i2 = max(g.xyz, l.zxy);
+    vec3 x1 = x0 - i1 + 1.0 * C.xxx;
+    vec3 x2 = x0 - i2 + 2.0 * C.xxx;
+    vec3 x3 = x0 - 1.0 + 3.0 * C.xxx;
+    i = mod(i, 289.0);
+    vec4 p = permute(permute(permute(
+              i.z + vec4(0.0, i1.z, i2.z, 1.0))
+            + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+            + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+    float n_ = 1.0/7.0;
+    vec3 ns = n_ * D.wyz - D.xzx;
+    vec4 j = p - 49.0 * floor(p * ns.z *ns.z);
+    vec4 x_ = floor(j * ns.z);
+    vec4 y_ = floor(j - 7.0 * x_);
+    vec4 x = x_ *ns.x + ns.yyyy;
+    vec4 y = y_ *ns.x + ns.yyyy;
+    vec4 h = 1.0 - abs(x) - abs(y);
+    vec4 b0 = vec4(x.xy, y.xy);
+    vec4 b1 = vec4(x.zw, y.zw);
+    vec4 s0 = floor(b0)*2.0 + 1.0;
+    vec4 s1 = floor(b1)*2.0 + 1.0;
+    vec4 sh = -step(h, vec4(0.0));
+    vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+    vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+    vec3 p0 = vec3(a0.xy, h.x);
+    vec3 p1 = vec3(a0.zw, h.y);
+    vec3 p2 = vec3(a1.xy, h.z);
+    vec3 p3 = vec3(a1.zw, h.w);
+    vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+    p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+    vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+    m = m * m;
+    return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+  }
 
-export default function Home() {
+  vec3 snoiseVec3(vec3 x){
+    return vec3(
+      snoise(x),
+      snoise(vec3(x.y - 19.1, x.z + 33.4, x.x + 47.2)),
+      snoise(vec3(x.z + 74.2, x.x - 124.5, x.y + 99.4))
+    );
+  }
+
+  vec3 curlNoise(vec3 p){
+    const float e = 0.1;
+    vec3 dx = vec3(e, 0.0, 0.0);
+    vec3 dy = vec3(0.0, e, 0.0);
+    vec3 dz = vec3(0.0, 0.0, e);
+    vec3 p_x0 = snoiseVec3(p - dx); vec3 p_x1 = snoiseVec3(p + dx);
+    vec3 p_y0 = snoiseVec3(p - dy); vec3 p_y1 = snoiseVec3(p + dy);
+    vec3 p_z0 = snoiseVec3(p - dz); vec3 p_z1 = snoiseVec3(p + dz);
+    float x = p_y1.z - p_y0.z - p_z1.y + p_z0.y;
+    float y = p_z1.x - p_z0.x - p_x1.z + p_x0.z;
+    float z = p_x1.y - p_x0.y - p_y1.x + p_y0.x;
+    return normalize(vec3(x, y, z) / (2.0 * e));
+  }
+
+  void main(){
+    vec3 pos = position;
+    // tempo follows the music a little: louder = faster flow
+    float t = uTime * (0.06 + uLevel * 0.05);
+
+    vec3 flow = curlNoise(pos * 0.16 + vec3(0.0, 0.0, t));
+    float amp = 1.1 + aSeed.x * 0.9;
+    pos += flow * amp;
+
+    pos.x += sin(t * 1.7 + aSeed.y * 6.2831) * 0.25;
+    pos.y += cos(t * 1.3 + aSeed.z * 6.2831) * 0.25;
+
+    // beat pulse: the whole field expands radially on the bass
+    vec3 radial = normalize(position + 0.0001);
+    pos += radial * uBass * (6.0 + aScale * 4.0);
+
+    // cursor repulsion
+    vec2 toMouse = pos.xy - uMouse;
+    float d = length(toMouse);
+    float influence = uMouseForce * exp(-d * d * 0.03);
+    pos.xy += normalize(toMouse + 0.0001) * influence;
+
+    // resting in green; energy (loudness + bass + cursor) pushes toward white
+    float ambient = (flow.y * 0.5 + 0.5) * 0.35;
+    vGlow = clamp(ambient + uLevel * 0.85 + uBass * 0.4 + influence * 0.12, 0.0, 1.0);
+
+    vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+    gl_Position = projectionMatrix * mv;
+    float pulse = 1.0 + uLevel * 1.3 + uBass * 0.6;
+    gl_PointSize = min(uSize * aScale * pulse * uPixelRatio * (1.0 / -mv.z), 80.0 * uPixelRatio);
+  }
+`;
+
+const fragmentShader = /* glsl */ `
+  precision highp float;
+
+  uniform vec3 uColorLow;
+  uniform vec3 uColorMid;
+  uniform vec3 uColorHigh;
+
+  varying float vGlow;
+
+  void main(){
+    vec2 uv = gl_PointCoord - 0.5;
+    float r = length(uv);
+    if (r > 0.5) discard;
+    float alpha = smoothstep(0.5, 0.0, r);
+    alpha = pow(alpha, 1.5);
+
+    vec3 col = mix(uColorLow, uColorMid, smoothstep(0.0, 0.6, vGlow));
+    col = mix(col, uColorHigh, smoothstep(0.6, 1.0, vGlow));
+
+    gl_FragColor = vec4(col, alpha * 0.9);
+  }
+`;
+
+export default function Notchster() {
+  const mountRef = useRef<HTMLDivElement>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const freqRef = useRef<Uint8Array | null>(null);
+  const [micState, setMicState] = useState<"off" | "on" | "error">("off");
+
+  // expose latest mic-state to the render loop without re-running the effect
+  const micOnRef = useRef(false);
+  micOnRef.current = micState === "on";
+
+  const enableMic = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const Ctx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
+      const ctx = new Ctx();
+      await ctx.resume();
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.82;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+      freqRef.current = new Uint8Array(analyser.frequencyBinCount);
+      setMicState("on");
+    } catch {
+      setMicState("error");
+    }
+  };
+
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount) return;
+
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: false,
+      powerPreference: "high-performance",
+    });
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    renderer.setPixelRatio(pixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x07080b, 1);
+    mount.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x07080b, 0.012);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      300
+    );
+    camera.position.set(0, 0, 24);
+
+    const COUNT = 90000;
+    const positions = new Float32Array(COUNT * 3);
+    const scales = new Float32Array(COUNT);
+    const seeds = new Float32Array(COUNT * 3);
+
+    const RX = 54;
+    const RY = 38;
+    const RZ = 48;
+    for (let i = 0; i < COUNT; i++) {
+      positions[i * 3 + 0] = (Math.random() * 2 - 1) * RX;
+      positions[i * 3 + 1] = (Math.random() * 2 - 1) * RY;
+      positions[i * 3 + 2] = (Math.random() * 2 - 1) * RZ;
+      scales[i] = 0.4 + Math.random() * Math.random() * 2.2;
+      seeds[i * 3 + 0] = Math.random();
+      seeds[i * 3 + 1] = Math.random();
+      seeds[i * 3 + 2] = Math.random();
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("aScale", new THREE.BufferAttribute(scales, 1));
+    geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 3));
+
+    const uniforms = {
+      uTime: { value: 0 },
+      uMouse: { value: new THREE.Vector2(9999, 9999) },
+      uMouseForce: { value: 0 },
+      uSize: { value: 26 * pixelRatio },
+      uPixelRatio: { value: pixelRatio },
+      uLevel: { value: 0 },
+      uBass: { value: 0 },
+      uColorLow: { value: new THREE.Color(0x7bdd2a) },
+      uColorMid: { value: new THREE.Color(0xc8ff3d) },
+      uColorHigh: { value: new THREE.Color(0xfff6e6) },
+    };
+
+    const material = new THREE.ShaderMaterial({
+      uniforms,
+      vertexShader,
+      fragmentShader,
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+      blending: THREE.AdditiveBlending,
+    });
+
+    const points = new THREE.Points(geometry, material);
+    scene.add(points);
+
+    // --- pointer tracking ---
+    const targetMouse = new THREE.Vector2(9999, 9999);
+    const smoothMouse = new THREE.Vector2(9999, 9999);
+    let targetForce = 0;
+    let active = false;
+    let lastCX = 0;
+    let lastCY = 0;
+    let lastCT = 0;
+
+    const planeDist = camera.position.z;
+    const vHeight = 2 * Math.tan((camera.fov * Math.PI) / 360) * planeDist;
+
+    const updatePointer = (clientX: number, clientY: number) => {
+      const ndcX = (clientX / window.innerWidth) * 2 - 1;
+      const ndcY = -((clientY / window.innerHeight) * 2 - 1);
+      const vWidth = vHeight * camera.aspect;
+      targetMouse.set((ndcX * vWidth) / 2, (ndcY * vHeight) / 2);
+      const now = performance.now();
+      if (lastCT) {
+        const dtp = (now - lastCT) / 1000;
+        if (dtp > 0) {
+          const px = Math.hypot(clientX - lastCX, clientY - lastCY) / dtp;
+          targetForce = Math.min(16, px * 0.007);
+        }
+      }
+      lastCX = clientX;
+      lastCY = clientY;
+      lastCT = now;
+      active = true;
+    };
+    const onMove = (e: PointerEvent) => updatePointer(e.clientX, e.clientY);
+    const onLeave = () => {
+      active = false;
+      lastCT = 0;
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerout", onLeave);
+
+    const onResize = () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      renderer.setSize(w, h);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    };
+    window.addEventListener("resize", onResize);
+
+    // --- audio: smoothed level + bass, from mic or a synthesized beat ---
+    let smoothLevel = 0;
+    let smoothBass = 0;
+
+    const sampleAudio = (t: number, dt: number) => {
+      let level = 0;
+      let bass = 0;
+      const analyser = analyserRef.current;
+      const data = freqRef.current;
+      if (micOnRef.current && analyser && data) {
+        analyser.getByteFrequencyData(data as Uint8Array<ArrayBuffer>);
+        const n = data.length;
+        let bSum = 0;
+        const bassBins = Math.max(1, Math.floor(n * 0.06));
+        for (let i = 0; i < bassBins; i++) bSum += data[i];
+        bass = bSum / bassBins / 255;
+        let sum = 0;
+        for (let i = 0; i < n; i++) sum += data[i];
+        level = sum / n / 255;
+        level = Math.min(1, level * 1.8);
+        bass = Math.min(1, bass * 1.4);
+      } else {
+        // synthesized groove (~112 BPM): a decaying kick + a softer off-beat
+        const bps = 112 / 60;
+        const phase = (t * bps) % 1;
+        const kick = Math.exp(-phase * 6.0);
+        const off = Math.exp(-(((phase + 0.5) % 1) * 8.0)) * 0.5;
+        bass = Math.min(1, kick + off * 0.4);
+        level = 0.16 + 0.45 * kick + 0.12 * (0.5 + 0.5 * Math.sin(t * 5.3));
+      }
+      // attack fast, release slow for a natural pump
+      const upL = 1 - Math.pow(0.0001, dt);
+      const dnL = 1 - Math.pow(0.2, dt);
+      smoothLevel += (level - smoothLevel) * (level > smoothLevel ? upL : dnL);
+      smoothBass += (bass - smoothBass) * (bass > smoothBass ? 1 - Math.pow(0.00001, dt) : 1 - Math.pow(0.12, dt));
+      return { level: smoothLevel, bass: smoothBass };
+    };
+
+    const clock = new THREE.Clock();
+    let raf = 0;
+    const render = () => {
+      const dt = Math.min(clock.getDelta(), 0.05);
+      const t = clock.elapsedTime;
+      uniforms.uTime.value = t;
+
+      const { level, bass } = sampleAudio(t, dt);
+      uniforms.uLevel.value = level;
+      uniforms.uBass.value = bass;
+
+      targetForce *= Math.pow(0.04, dt);
+      if (!active) {
+        targetMouse.set(
+          Math.cos(t * 0.25) * vHeight * 0.35,
+          Math.sin(t * 0.21) * vHeight * 0.28
+        );
+        targetForce = Math.max(targetForce, 1.2);
+      }
+
+      smoothMouse.lerp(targetMouse, 1 - Math.pow(0.0015, dt));
+      uniforms.uMouse.value.copy(smoothMouse);
+      uniforms.uMouseForce.value +=
+        (targetForce - uniforms.uMouseForce.value) * (1 - Math.pow(0.02, dt));
+
+      // field spins a touch faster with energy; camera pumps in on the bass
+      points.rotation.y = Math.sin(t * 0.06) * 0.12 + t * (0.01 + level * 0.04);
+      points.rotation.x = Math.cos(t * 0.05) * 0.06;
+      const targetZ = 24 - bass * 3.2;
+      camera.position.x += (smoothMouse.x * 0.04 - camera.position.x) * 0.02;
+      camera.position.y += (smoothMouse.y * 0.04 - camera.position.y) * 0.02;
+      camera.position.z += (targetZ - camera.position.z) * 0.12;
+      camera.lookAt(0, 0, 0);
+
+      renderer.render(scene, camera);
+      raf = requestAnimationFrame(render);
+    };
+    raf = requestAnimationFrame(render);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerout", onLeave);
+      window.removeEventListener("resize", onResize);
+      geometry.dispose();
+      material.dispose();
+      renderer.dispose();
+      if (renderer.domElement.parentNode === mount) {
+        mount.removeChild(renderer.domElement);
+      }
+    };
+  }, []);
+
   return (
-    <main className="relative overflow-x-hidden">
-      {/* faux notch at the very top of the page */}
+    <main className="relative h-screen w-screen overflow-hidden bg-[#07080b]">
+      <div ref={mountRef} className="absolute inset-0" />
+
+      {/* vignette */}
       <div
         aria-hidden
-        className="fixed left-1/2 top-0 z-50 h-7 w-[180px] -translate-x-1/2 rounded-b-2xl bg-black"
-      />
-
-      <Nav />
-      <Hero />
-      <Statement />
-      <Features />
-      <Themes />
-      <Download />
-      <Footer />
-    </main>
-  );
-}
-
-/* ----------------------------------------------------------------- Nav */
-function Nav() {
-  return (
-    <header className="sticky top-0 z-40 border-b border-white/[0.06] bg-background/70 backdrop-blur-xl backdrop-saturate-150">
-      <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-3.5">
-        <a href="#top" className="flex items-center gap-2.5 font-display font-bold">
-          <span className="ascii text-[0.5rem] leading-[0.85] text-accent">{BUNNY}</span>
-          <span className="text-lg tracking-tight">Notchster</span>
-        </a>
-        <nav className="flex items-center gap-6 text-sm font-medium">
-          <a
-            href="#features"
-            className="hidden text-muted transition-colors hover:text-foreground sm:inline"
-          >
-            Features
-          </a>
-          <a
-            href={SOURCE_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hidden text-muted transition-colors hover:text-foreground sm:inline"
-          >
-            Source
-          </a>
-          <a
-            href={DOWNLOAD_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="rounded-full bg-accent px-4 py-2 text-sm font-semibold text-black transition-transform hover:scale-[1.03] active:scale-95"
-          >
-            Download
-          </a>
-        </nav>
-      </div>
-    </header>
-  );
-}
-
-/* ---------------------------------------------------------------- Hero */
-function Hero() {
-  return (
-    <section id="top" className="relative mx-auto max-w-5xl px-6 pt-24 text-center sm:pt-28">
-      {/* accent glow */}
-      <div
-        aria-hidden
-        className="pointer-events-none absolute left-1/2 top-10 -z-10 h-[420px] w-[680px] max-w-[120%] -translate-x-1/2 rounded-full bg-accent/15 blur-[120px]"
-      />
-
-      <motion.p
-        custom={0}
-        variants={fadeUp}
-        initial="hidden"
-        animate="show"
-        className="font-mono text-xs uppercase tracking-[0.25em] text-accent"
-      >
-        Notchster for Mac
-      </motion.p>
-
-      <motion.h1
-        custom={1}
-        variants={fadeUp}
-        initial="hidden"
-        animate="show"
-        className="mt-5 text-5xl font-bold leading-[1.02] tracking-tight sm:text-7xl md:text-8xl"
-      >
-        Your notch,
-        <br />
-        but <span className="text-accent">cuter.</span>
-      </motion.h1>
-
-      <motion.p
-        custom={2}
-        variants={fadeUp}
-        initial="hidden"
-        animate="show"
-        className="mx-auto mt-7 max-w-xl text-lg text-muted"
-      >
-        A playful menu-bar companion. A little ASCII bunny springs down from your
-        notch with weather, music, system stats, and on-device AI.
-      </motion.p>
-
-      <motion.div
-        custom={3}
-        variants={fadeUp}
-        initial="hidden"
-        animate="show"
-        className="mt-9 flex flex-wrap items-center justify-center gap-3"
-      >
-        <a
-          href={DOWNLOAD_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="rounded-full bg-accent px-7 py-3.5 text-base font-semibold text-black shadow-[0_12px_50px_-12px_var(--accent)] transition-transform hover:scale-[1.03] active:scale-95"
-        >
-          Download for Mac
-        </a>
-        <a
-          href={SOURCE_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="rounded-full border border-white/15 px-7 py-3.5 text-base font-semibold text-foreground transition-colors hover:border-white/40"
-        >
-          View source ›
-        </a>
-      </motion.div>
-
-      <motion.p
-        custom={4}
-        variants={fadeUp}
-        initial="hidden"
-        animate="show"
-        className="mt-5 text-sm text-muted"
-      >
-        Free &amp; open source · macOS 26.2+ · no API keys, no subscriptions
-      </motion.p>
-
-      <motion.div
-        custom={5}
-        variants={fadeUp}
-        initial="hidden"
-        animate="show"
-        className="mt-16"
-      >
-        <MacMockup />
-      </motion.div>
-    </section>
-  );
-}
-
-/* --------------------------------------------------- MacBook mockup */
-function MacMockup() {
-  return (
-    <div className="relative mx-auto w-full max-w-4xl">
-      <div
-        className="group/mac relative flex min-h-[360px] flex-col items-center overflow-hidden rounded-[26px] border-[10px] border-[#0b0b0c] sm:min-h-[460px]"
+        className="pointer-events-none absolute inset-0"
         style={{
-          boxShadow:
-            "0 0 0 2px #2b2c2f, 0 60px 120px -40px rgba(0,0,0,0.85), inset 0 0 60px rgba(0,0,0,0.5)",
+          background:
+            "radial-gradient(120% 120% at 50% 50%, transparent 52%, rgba(0,0,0,0.6) 100%)",
         }}
-      >
-        {/* desktop wallpaper (CSS gradient) */}
-        <div
-          aria-hidden
-          className="absolute inset-0"
-          style={{
-            background:
-              "radial-gradient(120% 90% at 30% 20%, #1d3b6e 0%, #122a52 35%, #0a1430 70%, #060a18 100%)",
-          }}
-        />
-        <div
-          aria-hidden
-          className="absolute inset-0 opacity-60"
-          style={{
-            background:
-              "radial-gradient(60% 50% at 75% 85%, rgba(200,255,61,0.18), transparent 70%)",
-          }}
-        />
+      />
 
-        {/* hover zone: the notch + the panel that drops from it */}
-        <div className="absolute left-1/2 top-0 z-10 -translate-x-1/2 cursor-pointer px-8 pb-6">
-          {/* the device notch */}
-          <div className="relative z-20 mx-auto h-6 w-[130px] rounded-b-[11px] bg-black transition-[filter] duration-300 group-hover/mac:brightness-150 sm:h-[26px] sm:w-[150px]" />
-
-          {/* the drop-down panel (tucked behind the notch by default) */}
-          <div
-            className="absolute left-1/2 top-0 z-10 w-[min(86vw,440px)] -translate-x-1/2 -translate-y-[102%] rounded-b-[22px] border border-t-0 border-[#131316] bg-black px-2 pb-3 opacity-0 shadow-[0_30px_60px_-24px_rgba(0,0,0,0.9)] transition-all duration-[550ms] ease-[cubic-bezier(0.34,1.4,0.5,1)] group-hover/mac:translate-y-0 group-hover/mac:opacity-100"
-            role="img"
-            aria-label="Notchster panel preview"
+      {/* overlay */}
+      <div className="pointer-events-none relative z-10 flex h-full flex-col">
+        {/* top bar */}
+        <div className="flex items-start justify-between p-6 sm:p-10">
+          <a
+            href="https://reesebrockman.com"
+            className="pointer-events-auto font-mono text-xs uppercase tracking-[0.2em] text-white/55 transition-colors hover:text-white"
           >
-            <PanelContents />
-          </div>
+            ← Reese Brockman
+          </a>
+          <span className="font-mono text-xs uppercase tracking-[0.2em] text-white/35">
+            Live Visuals · macOS
+          </span>
         </div>
 
-        {/* hint */}
-        <span className="hint-pulse pointer-events-none absolute top-12 left-1/2 z-0 -translate-x-1/2 text-sm font-semibold text-white/80 transition-opacity duration-300 group-hover/mac:opacity-0">
-          ↑ Hover the notch
-        </span>
-      </div>
-    </div>
-  );
-}
-
-function PanelContents() {
-  return (
-    <>
-      {/* top bar: tabs · notch gap · gear */}
-      <div className="flex h-[30px] items-center">
-        <div className="flex flex-1 items-center justify-end gap-1.5 pr-1.5">
-          <span className="rounded-full bg-accent/20 px-2 py-[3px] text-[0.62rem] font-bold text-foreground">
+        {/* center */}
+        <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
+          <span className="mb-5 font-mono text-xs uppercase tracking-[0.3em] text-accent/90">
+            Coming soon
+          </span>
+          <h1
+            className="text-6xl font-bold tracking-tight text-white sm:text-8xl"
+            style={{ textShadow: "0 0 50px rgba(200,255,61,0.3)" }}
+          >
             Notchster
-          </span>
-          <span className="px-2 py-[3px] text-[0.62rem] font-bold text-white/45">Tray</span>
-        </div>
-        <div className="w-[130px] shrink-0 sm:w-[150px]" />
-        <div className="flex flex-1 items-center pl-1.5 text-white/55">
-          <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor">
-            <path d="M8 5.2a2.8 2.8 0 1 0 0 5.6 2.8 2.8 0 0 0 0-5.6zm0 1.6a1.2 1.2 0 1 1 0 2.4 1.2 1.2 0 0 1 0-2.4z" />
-            <path
-              d="M6.9.8h2.2l.3 1.8q.6.2 1.1.5l1.6-.9 1.6 1.6-.9 1.6q.3.5.5 1.1l1.8.3v2.2l-1.8.3q-.2.6-.5 1.1l.9 1.6-1.6 1.6-1.6-.9q-.5.3-1.1.5l-.3 1.8H6.9l-.3-1.8q-.6-.2-1.1-.5l-1.6.9-1.6-1.6.9-1.6q-.3-.5-.5-1.1L.4 9.1V6.9l1.8-.3q.2-.6.5-1.1l-.9-1.6 1.6-1.6 1.6.9q.5-.3 1.1-.5z"
-              opacity="0.85"
-            />
-          </svg>
-        </div>
-      </div>
-
-      {/* bunny scene with twinkling stars */}
-      <div className="relative mt-1 flex h-[104px] items-center justify-center">
-        <div aria-hidden className="pointer-events-none absolute inset-0 text-accent">
-          <span className="twinkle absolute left-[16%] top-3 text-xs">✦</span>
-          <span className="twinkle absolute right-[18%] top-2 text-xs" style={{ animationDelay: "0.6s" }}>
-            ✧
-          </span>
-          <span className="twinkle absolute bottom-5 left-[24%] text-xs" style={{ animationDelay: "1.2s" }}>
-            ✦
-          </span>
-          <span className="twinkle absolute left-[44%] top-10 text-xs" style={{ animationDelay: "1.8s" }}>
-            ✧
-          </span>
-          <span className="twinkle absolute bottom-4 right-[26%] text-xs" style={{ animationDelay: "0.3s" }}>
-            ✦
-          </span>
-        </div>
-        <pre className="ascii z-[1] m-0 text-center text-base text-white">{BUNNY}</pre>
-      </div>
-
-      {/* now playing */}
-      <div className="flex items-center gap-3 px-2 pt-2.5 text-left">
-        <div
-          className="flex h-[58px] w-[58px] shrink-0 items-center justify-center rounded-[11px]"
-          style={{
-            background: "linear-gradient(140deg, #fb5c74 0%, #fa2d48 45%, #b5179e 100%)",
-            boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.08)",
-          }}
-        >
-          <span className="text-2xl text-white/85">♫</span>
-        </div>
-        <div className="flex min-w-0 flex-1 flex-col justify-center">
-          <div className="flex items-center gap-1.5">
-            <span className="truncate text-sm font-bold text-white">The Eliminating Angel</span>
-            <span className="flex h-3 shrink-0 items-end gap-[2px]">
-              <i className="eqbar w-[2.5px] rounded-sm bg-accent" />
-              <i className="eqbar w-[2.5px] rounded-sm bg-accent" style={{ animationDelay: "0.15s" }} />
-              <i className="eqbar w-[2.5px] rounded-sm bg-accent" style={{ animationDelay: "0.3s" }} />
-              <i className="eqbar w-[2.5px] rounded-sm bg-accent" style={{ animationDelay: "0.45s" }} />
-            </span>
-          </div>
-          <div className="mt-px text-xs text-white/85">Metavoid</div>
-          <div className="mt-px text-[0.7rem] text-white/45">Lustmord</div>
-          <div className="mt-2">
-            <div className="h-[3px] overflow-hidden rounded-full bg-white/20">
-              <span className="block h-full w-[34%] rounded-full bg-white" />
-            </div>
-            <div className="mt-1 flex justify-between font-mono text-[0.6rem] tabular-nums text-white/45">
-              <span>1:13</span>
-              <span>3:35</span>
-            </div>
-          </div>
-        </div>
-      </div>
-    </>
-  );
-}
-
-/* ----------------------------------------------------------- Statement */
-function Statement() {
-  return (
-    <section className="mx-auto max-w-5xl px-6 py-32 text-center sm:py-40">
-      <motion.h2
-        initial={{ opacity: 0, y: 28 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true, margin: "-100px" }}
-        transition={{ duration: 0.7, ease: [0.16, 1, 0.3, 1] }}
-        className="text-4xl font-bold leading-[1.05] tracking-tight sm:text-6xl"
-      >
-        Everything you love
-        <br />
-        about your notch.
-        <br />
-        <span className="text-muted">And a bunny.</span>
-      </motion.h2>
-    </section>
-  );
-}
-
-/* ------------------------------------------------------------ Features */
-function Features() {
-  return (
-    <section id="features" className="mx-auto max-w-6xl px-6">
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-6">
-        {/* AI — large */}
-        <Card className="sm:col-span-4 sm:row-span-2 flex flex-col">
-          <div>
-            <Kicker>On-device AI</Kicker>
-            <h3 className="text-3xl font-bold tracking-tight sm:text-4xl">
-              Ask Bunny
-              <br />
-              anything.
-            </h3>
-            <p className="mt-3 max-w-md text-muted">
-              A private assistant powered by Apple Intelligence. Runs entirely on your
-              Mac — no network, no API keys, no token costs.
-            </p>
-          </div>
-          <div aria-hidden className="mt-auto flex flex-col gap-2.5 pt-7">
-            <div className="self-end rounded-2xl rounded-br-md bg-accent px-4 py-2.5 text-sm font-medium text-black">
-              What&apos;s the weather looking like?
-            </div>
-            <div className="self-start rounded-2xl rounded-bl-md bg-white/[0.06] px-4 py-2.5 text-sm">
-              Clear skies and 68° near you — perfect bunny weather. 🐰
-            </div>
-            <div className="mt-1.5 rounded-full border border-white/10 bg-black/40 px-4 py-3 text-sm text-muted">
-              Ask Bunny anything…
-            </div>
-          </div>
-        </Card>
-
-        {/* Weather */}
-        <Card className="sm:col-span-2">
-          <Kicker>Local weather</Kicker>
-          <h3 className="text-2xl font-bold tracking-tight">Weather, instantly.</h3>
-          <p className="mt-2 text-sm text-muted">
-            Conditions, feels-like, and the day&apos;s high/low via Open-Meteo. No API key
-            required.
+          </h1>
+          <p className="mt-6 max-w-md text-base text-white/70 sm:text-lg">
+            A live-visuals instrument for musicians and DJs — perform your own
+            reactive visuals straight from your Mac.
           </p>
-          <div aria-hidden className="mt-5">
-            <div className="text-5xl font-bold leading-none text-foreground">68°</div>
-            <div className="mt-1.5 text-sm text-muted">Partly Cloudy · H:72° L:54°</div>
-          </div>
-        </Card>
 
-        {/* Music */}
-        <Card className="sm:col-span-2">
-          <Kicker>Apple Music &amp; Spotify</Kicker>
-          <h3 className="text-2xl font-bold tracking-tight">Now playing.</h3>
-          <p className="mt-2 text-sm text-muted">
-            See what&apos;s playing and control it — album art, a live timeline, and
-            transport controls, styled like Dynamic Island.
+          <button
+            type="button"
+            onClick={enableMic}
+            disabled={micState === "on"}
+            className="pointer-events-auto mt-9 rounded-full border border-accent/40 bg-accent/10 px-6 py-3 font-mono text-xs uppercase tracking-[0.15em] text-accent backdrop-blur-sm transition-all hover:border-accent/70 hover:bg-accent/20 disabled:cursor-default disabled:border-white/15 disabled:bg-white/5 disabled:text-white/50"
+          >
+            {micState === "on"
+              ? "● listening — make some noise"
+              : micState === "error"
+                ? "mic blocked — check permissions"
+                : "▶ react to your sound"}
+          </button>
+          <p className="mt-3 font-mono text-[0.65rem] uppercase tracking-[0.15em] text-white/30">
+            {micState === "on"
+              ? "the field is reacting to your audio"
+              : "running on a synth beat · tap to use your mic"}
           </p>
-          <div aria-hidden className="mt-5 flex h-11 items-end gap-1.5">
-            {[0, 0.12, 0.24, 0.36, 0.48, 0.6, 0.72].map((d, i) => (
-              <i
-                key={i}
-                className="eqbar w-[7px] rounded-sm"
-                style={{
-                  background: "linear-gradient(180deg,#fb5c74,#b5179e)",
-                  animationDelay: `${d}s`,
-                }}
-              />
-            ))}
-          </div>
-        </Card>
+        </div>
 
-        {/* System stats */}
-        <Card className="sm:col-span-2">
-          <Kicker>System stats</Kicker>
-          <h3 className="text-2xl font-bold tracking-tight">Vital signs.</h3>
-          <p className="mt-2 text-sm text-muted">
-            Battery, CPU, and memory at a glance with color-coded load bars.
-          </p>
-          <div aria-hidden className="mt-5 flex flex-col gap-3">
-            <StatBar label="BAT" value="82%" color="#4dcc73" />
-            <StatBar label="CPU" value="46%" color="#ff9f43" />
-            <StatBar label="MEM" value="67%" color="#ff5c5c" />
-          </div>
-        </Card>
-
-        {/* Living scene — wide */}
-        <Card className="group/scene sm:col-span-4 flex flex-col justify-between">
-          <div>
-            <Kicker>A living scene</Kicker>
-            <h3 className="text-3xl font-bold tracking-tight sm:text-4xl">
-              Alive, day and night.
-            </h3>
-            <p className="mt-3 max-w-lg text-muted">
-              An ASCII bunny that tracks your cursor, drifts past clouds by day,
-              twinkles under shooting stars at night, and sleeps with floating z&apos;s —
-              themed by your real sunrise and sunset.
-            </p>
-          </div>
-          <pre
-            aria-hidden
-            className="scene-bunny ascii mt-6 overflow-hidden text-[0.8rem] text-accent sm:text-base"
-          >{`    .   *        .       *
-  *     (\\_/)   .     *
-        (o.o)      .
-   .    (")_(")  *    .
-  _____________________`}</pre>
-        </Card>
-
-        {/* Calm */}
-        <Card className="sm:col-span-2">
-          <Kicker>Stays out of the way</Kicker>
-          <h3 className="text-2xl font-bold tracking-tight">A gentle drop.</h3>
-          <p className="mt-2 text-sm text-muted">
-            Springs down from the notch when you want it, never steals focus, and tucks
-            away the moment your pointer leaves.
-          </p>
-        </Card>
+        {/* footer */}
+        <div className="flex items-center justify-center p-6 sm:p-10">
+          <span className="font-mono text-xs uppercase tracking-[0.2em] text-white/35">
+            Three.js · GLSL · Web Audio
+          </span>
+        </div>
       </div>
-    </section>
-  );
-}
-
-function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  return (
-    <motion.article
-      onPointerMove={handleSpot}
-      initial={{ opacity: 0, y: 24 }}
-      whileInView={{ opacity: 1, y: 0 }}
-      viewport={{ once: true, margin: "-60px" }}
-      transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
-      className={`group/card relative overflow-hidden rounded-3xl border border-white/[0.08] bg-white/[0.02] p-8 transition-colors duration-300 hover:border-white/20 ${className}`}
-    >
-      <div aria-hidden className="card-glow pointer-events-none absolute inset-0 rounded-3xl" />
-      <div className="relative z-[1] flex h-full flex-col">{children}</div>
-    </motion.article>
-  );
-}
-
-function Kicker({ children }: { children: React.ReactNode }) {
-  return (
-    <p className="mb-3 font-mono text-xs font-semibold uppercase tracking-[0.15em] text-accent">
-      {children}
-    </p>
-  );
-}
-
-function StatBar({ label, value, color }: { label: string; value: string; color: string }) {
-  return (
-    <div className="flex items-center gap-3">
-      <span className="w-9 font-mono text-[0.7rem] text-muted">{label}</span>
-      <div className="h-2 flex-1 overflow-hidden rounded-full bg-white/[0.08]">
-        <span
-          className="block h-full w-0 rounded-full transition-[width] duration-700 ease-out group-hover/card:w-[var(--w)]"
-          style={{ "--w": value, background: color } as React.CSSProperties}
-        />
-      </div>
-    </div>
-  );
-}
-
-/* -------------------------------------------------------------- Themes */
-function Themes() {
-  return (
-    <section className="mx-auto max-w-5xl px-6 py-36 text-center">
-      <motion.h2
-        initial={{ opacity: 0, y: 24 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true, margin: "-80px" }}
-        transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
-        className="text-4xl font-bold tracking-tight sm:text-5xl"
-      >
-        Make it yours.
-      </motion.h2>
-      <p className="mt-4 text-lg text-muted">Six accent themes, tuned for day and night.</p>
-      <div className="mt-10 flex justify-center gap-4">
-        {themeSwatches.map((t, i) => (
-          <motion.span
-            key={t.name}
-            title={t.name}
-            initial={{ opacity: 0, scale: 0.6 }}
-            whileInView={{ opacity: 1, scale: 1 }}
-            viewport={{ once: true }}
-            transition={{ duration: 0.4, delay: i * 0.05, ease: [0.16, 1, 0.3, 1] }}
-            whileHover={{ scale: 1.2 }}
-            className="h-10 w-10 rounded-full ring-2 ring-white/10"
-            style={{ background: t.c }}
-          />
-        ))}
-      </div>
-    </section>
-  );
-}
-
-/* ------------------------------------------------------------ Download */
-function Download() {
-  return (
-    <section className="mx-auto max-w-2xl px-6 pb-32 text-center">
-      <motion.div
-        initial={{ opacity: 0, y: 28 }}
-        whileInView={{ opacity: 1, y: 0 }}
-        viewport={{ once: true, margin: "-80px" }}
-        transition={{ duration: 0.7, ease: [0.16, 1, 0.3, 1] }}
-      >
-        <pre className="ascii mx-auto text-center text-sm text-accent">{BUNNY}</pre>
-        <h2 className="mt-6 text-4xl font-bold tracking-tight sm:text-5xl">Get Notchster.</h2>
-        <p className="mt-4 text-lg text-muted">
-          Free and open source. Bring your notch to life in seconds.
-        </p>
-        <a
-          href={DOWNLOAD_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="mt-8 inline-block rounded-full bg-accent px-9 py-4 text-lg font-semibold text-black shadow-[0_12px_50px_-12px_var(--accent)] transition-transform hover:scale-[1.03] active:scale-95"
-        >
-          Download for Mac
-        </a>
-        <ul className="mx-auto mt-11 inline-block space-y-2.5 text-left text-muted">
-          {[
-            "macOS 26.2 or later",
-            "Apple Silicon recommended (required for AI)",
-            "Location & Automation permissions for weather & music",
-          ].map((req) => (
-            <li key={req} className="relative pl-7">
-              <span className="absolute left-0 font-bold text-accent">✓</span>
-              {req}
-            </li>
-          ))}
-        </ul>
-        <p className="mx-auto mt-7 max-w-md text-sm text-muted">
-          Grab <code className="rounded bg-white/[0.06] px-1.5 py-0.5 font-mono text-xs">Notchster.dmg</code>{" "}
-          from the latest release. If Gatekeeper blocks an unsigned build, open{" "}
-          <strong className="text-foreground/80">System Settings → Privacy &amp; Security</strong> and click{" "}
-          <strong className="text-foreground/80">Open Anyway</strong>.
-        </p>
-      </motion.div>
-    </section>
-  );
-}
-
-/* -------------------------------------------------------------- Footer */
-function Footer() {
-  return (
-    <footer className="border-t border-white/[0.06] px-6 py-8 text-center text-sm text-muted">
-      <p>
-        <span className="ascii mr-2 inline-block align-middle text-accent">{`(\\_/)`}</span>
-        Made with care by{" "}
-        <a
-          href="https://github.com/ReeseBrockman"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-accent hover:underline"
-        >
-          Reese Brockman
-        </a>
-        . MIT licensed.
-      </p>
-    </footer>
+    </main>
   );
 }
