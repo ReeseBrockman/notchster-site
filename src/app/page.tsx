@@ -13,8 +13,6 @@ import * as THREE from "three";
 
 const vertexShader = /* glsl */ `
   uniform float uTime;
-  uniform vec2  uMouse;
-  uniform float uMouseForce;
   uniform float uSize;
   uniform float uPixelRatio;
   uniform float uLevel;   // overall loudness 0..1
@@ -108,15 +106,9 @@ const vertexShader = /* glsl */ `
     vec3 radial = normalize(position + 0.0001);
     pos += radial * uBass * (6.0 + aScale * 4.0);
 
-    // cursor repulsion
-    vec2 toMouse = pos.xy - uMouse;
-    float d = length(toMouse);
-    float influence = uMouseForce * exp(-d * d * 0.03);
-    pos.xy += normalize(toMouse + 0.0001) * influence;
-
-    // resting in green; energy (loudness + bass + cursor) pushes toward white
+    // resting in green; energy (loudness + bass) pushes toward white
     float ambient = (flow.y * 0.5 + 0.5) * 0.35;
-    vGlow = clamp(ambient + uLevel * 0.85 + uBass * 0.4 + influence * 0.12, 0.0, 1.0);
+    vGlow = clamp(ambient + uLevel * 0.85 + uBass * 0.4, 0.0, 1.0);
 
     vec4 mv = modelViewMatrix * vec4(pos, 1.0);
     gl_Position = projectionMatrix * mv;
@@ -154,14 +146,16 @@ export default function Notchster() {
   const freqRef = useRef<Uint8Array | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
-  const [micState, setMicState] = useState<"off" | "on" | "error">("off");
+  type Source = "mic" | "browser";
+  const [source, setSource] = useState<Source | "off">("off");
+  const [error, setError] = useState<Source | null>(null);
 
-  // expose latest mic-state to the render loop without re-running the effect
-  const micOnRef = useRef(false);
-  micOnRef.current = micState === "on";
+  // expose whether an external source is live to the render loop
+  const audioOnRef = useRef(false);
+  audioOnRef.current = source !== "off";
 
-  // release the mic + tear down the audio graph (back to the synth beat)
-  const stopMic = () => {
+  // release any capture + tear down the audio graph (back to the fluid flow)
+  const stopAudio = () => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     if (ctxRef.current) {
@@ -172,37 +166,65 @@ export default function Notchster() {
     freqRef.current = null;
   };
 
-  const toggleMic = async () => {
-    if (micState === "on") {
-      stopMic();
-      setMicState("off");
+  // wire a captured stream's audio into the analyser the render loop samples
+  const listenTo = (stream: MediaStream) => {
+    const Ctx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext })
+        .webkitAudioContext;
+    const ctx = new Ctx();
+    void ctx.resume();
+    const node = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.82;
+    node.connect(analyser);
+    streamRef.current = stream;
+    ctxRef.current = ctx;
+    analyserRef.current = analyser;
+    freqRef.current = new Uint8Array(analyser.frequencyBinCount);
+  };
+
+  const toggleSource = async (kind: Source) => {
+    // tapping the active source turns it off, back to the fluid flow
+    if (source === kind) {
+      stopAudio();
+      setSource("off");
       return;
     }
+    // only one analyser — switching sources drops whatever's listening first
+    stopAudio();
+    setError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const Ctx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext })
-          .webkitAudioContext;
-      const ctx = new Ctx();
-      await ctx.resume();
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.82;
-      source.connect(analyser);
-      streamRef.current = stream;
-      ctxRef.current = ctx;
-      analyserRef.current = analyser;
-      freqRef.current = new Uint8Array(analyser.frequencyBinCount);
-      setMicState("on");
+      const stream =
+        kind === "mic"
+          ? await navigator.mediaDevices.getUserMedia({ audio: true })
+          : await navigator.mediaDevices.getDisplayMedia({
+              video: true,
+              audio: true,
+            });
+      // browser-audio capture is only useful if a tab's audio was shared
+      if (kind === "browser" && stream.getAudioTracks().length === 0) {
+        stream.getTracks().forEach((t) => t.stop());
+        setSource("off");
+        setError("browser");
+        return;
+      }
+      // if the user stops sharing from the browser UI, fall back to the flow
+      stream.getAudioTracks()[0]?.addEventListener("ended", () => {
+        stopAudio();
+        setSource("off");
+      });
+      listenTo(stream);
+      setSource(kind);
     } catch {
-      setMicState("error");
+      setSource("off");
+      setError(kind);
     }
   };
 
-  // make sure the mic is released if the page unmounts while listening
-  useEffect(() => stopMic, []);
+  // make sure any capture is released if the page unmounts while listening
+  useEffect(() => stopAudio, []);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -255,8 +277,6 @@ export default function Notchster() {
 
     const uniforms = {
       uTime: { value: 0 },
-      uMouse: { value: new THREE.Vector2(9999, 9999) },
-      uMouseForce: { value: 0 },
       uSize: { value: 26 * pixelRatio },
       uPixelRatio: { value: pixelRatio },
       uLevel: { value: 0 },
@@ -279,44 +299,6 @@ export default function Notchster() {
     const points = new THREE.Points(geometry, material);
     scene.add(points);
 
-    // --- pointer tracking ---
-    const targetMouse = new THREE.Vector2(9999, 9999);
-    const smoothMouse = new THREE.Vector2(9999, 9999);
-    let targetForce = 0;
-    let active = false;
-    let lastCX = 0;
-    let lastCY = 0;
-    let lastCT = 0;
-
-    const planeDist = camera.position.z;
-    const vHeight = 2 * Math.tan((camera.fov * Math.PI) / 360) * planeDist;
-
-    const updatePointer = (clientX: number, clientY: number) => {
-      const ndcX = (clientX / window.innerWidth) * 2 - 1;
-      const ndcY = -((clientY / window.innerHeight) * 2 - 1);
-      const vWidth = vHeight * camera.aspect;
-      targetMouse.set((ndcX * vWidth) / 2, (ndcY * vHeight) / 2);
-      const now = performance.now();
-      if (lastCT) {
-        const dtp = (now - lastCT) / 1000;
-        if (dtp > 0) {
-          const px = Math.hypot(clientX - lastCX, clientY - lastCY) / dtp;
-          targetForce = Math.min(16, px * 0.007);
-        }
-      }
-      lastCX = clientX;
-      lastCY = clientY;
-      lastCT = now;
-      active = true;
-    };
-    const onMove = (e: PointerEvent) => updatePointer(e.clientX, e.clientY);
-    const onLeave = () => {
-      active = false;
-      lastCT = 0;
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerout", onLeave);
-
     const onResize = () => {
       const w = window.innerWidth;
       const h = window.innerHeight;
@@ -329,14 +311,13 @@ export default function Notchster() {
     // --- audio: smoothed level + bass, from mic or a synthesized beat ---
     let smoothLevel = 0;
     let smoothBass = 0;
-    let beatPhase = 0; // separate clock for the synth groove (never uses wall elapsedTime)
 
     const sampleAudio = (dt: number) => {
       let level = 0;
       let bass = 0;
       const analyser = analyserRef.current;
       const data = freqRef.current;
-      if (micOnRef.current && analyser && data) {
+      if (audioOnRef.current && analyser && data) {
         analyser.getByteFrequencyData(data as Uint8Array<ArrayBuffer>);
         const n = data.length;
         let bSum = 0;
@@ -349,16 +330,13 @@ export default function Notchster() {
         level = Math.min(1, level * 1.8);
         bass = Math.min(1, bass * 1.4);
       } else {
-        // synthesized groove (~112 BPM): a decaying kick + a softer off-beat
-        beatPhase = (beatPhase + dt * (112 / 60)) % 1;
-        const kick = Math.exp(-beatPhase * 6.0);
-        const off = Math.exp(-(((beatPhase + 0.5) % 1) * 8.0)) * 0.5;
-        bass = Math.min(1, kick + off * 0.4);
-        // synth is already smooth — use it directly so level can't ratchet upward
-        level = 0.16 + 0.45 * kick + 0.12 * (0.5 + 0.5 * Math.sin(beatPhase * 6.2831 * 2));
+        // mic off: no beat at all — a calm, steady flood so the particles just
+        // drift through the curl-noise field as one fluid, seamless current.
+        bass = 0;
+        level = 0.18;
       }
       // attack fast, release slow for mic input only
-      if (micOnRef.current) {
+      if (audioOnRef.current) {
         const upL = 1 - Math.pow(0.0001, dt);
         const dnL = 1 - Math.pow(0.2, dt);
         smoothLevel += (level - smoothLevel) * (level > smoothLevel ? upL : dnL);
@@ -392,29 +370,12 @@ export default function Notchster() {
       uniforms.uLevel.value = level;
       uniforms.uBass.value = bass;
 
-      targetForce *= Math.pow(0.04, dt);
-      if (!active) {
-        targetMouse.set(
-          Math.cos(ambientT * 0.25) * vHeight * 0.35,
-          Math.sin(ambientT * 0.21) * vHeight * 0.28
-        );
-        // gentle ambient motion only — don't force a permanent high push strength
-        targetForce = Math.max(targetForce, 0.35);
-      }
-
-      smoothMouse.lerp(targetMouse, 1 - Math.pow(0.0015, dt));
-      uniforms.uMouse.value.copy(smoothMouse);
-      uniforms.uMouseForce.value +=
-        (targetForce - uniforms.uMouseForce.value) * (1 - Math.pow(0.02, dt));
-
       // integrate spin per frame so angular velocity stays bounded
       spinY += dt * (0.012 + level * 0.028);
       spinX = Math.cos(ambientT * 0.05) * 0.06;
       points.rotation.y = Math.sin(ambientT * 0.06) * 0.12 + spinY;
       points.rotation.x = spinX;
       const targetZ = 24 - bass * 3.2;
-      camera.position.x += (smoothMouse.x * 0.04 - camera.position.x) * 0.02;
-      camera.position.y += (smoothMouse.y * 0.04 - camera.position.y) * 0.02;
       camera.position.z += (targetZ - camera.position.z) * 0.12;
       camera.lookAt(0, 0, 0);
 
@@ -425,8 +386,6 @@ export default function Notchster() {
 
     return () => {
       cancelAnimationFrame(raf);
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerout", onLeave);
       window.removeEventListener("resize", onResize);
       geometry.dispose();
       material.dispose();
@@ -453,23 +412,10 @@ export default function Notchster() {
 
       {/* overlay */}
       <div className="pointer-events-none relative z-10 flex h-full flex-col">
-        {/* top bar */}
-        <div className="flex items-start justify-between p-6 sm:p-10">
-          <a
-            href="https://reesebrockman.com"
-            className="pointer-events-auto font-mono text-xs uppercase tracking-[0.2em] text-white/55 transition-colors hover:text-white"
-          >
-            ← Reese Brockman
-          </a>
-          <span className="font-mono text-xs uppercase tracking-[0.2em] text-white/35">
-            Live Visuals · macOS
-          </span>
-        </div>
-
         {/* center */}
         <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-          <span className="mb-5 font-mono text-xs uppercase tracking-[0.3em] text-accent/90">
-            Coming soon
+          <span className="mb-5 font-mono text-xs uppercase tracking-[0.3em] text-accent/80">
+            App in development
           </span>
           <h1
             className="text-6xl font-bold tracking-tight text-white sm:text-8xl"
@@ -477,39 +423,49 @@ export default function Notchster() {
           >
             Notchster
           </h1>
-          <p className="mt-6 max-w-md text-base text-white/70 sm:text-lg">
-            A live-visuals instrument for musicians and DJs — perform your own
-            reactive visuals straight from your Mac.
-          </p>
 
-          <button
-            type="button"
-            onClick={toggleMic}
-            aria-pressed={micState === "on"}
-            className={`pointer-events-auto mt-9 rounded-full border px-6 py-3 font-mono text-xs uppercase tracking-[0.15em] backdrop-blur-sm transition-all ${
-              micState === "on"
-                ? "border-accent bg-accent/20 text-accent hover:bg-accent/30"
-                : "border-accent/40 bg-accent/10 text-accent hover:border-accent/70 hover:bg-accent/20"
-            }`}
-          >
-            {micState === "on"
-              ? "● mic on — tap to turn off"
-              : micState === "error"
-                ? "mic blocked — tap to retry"
-                : "▶ turn on mic"}
-          </button>
-          <p className="mt-3 font-mono text-[0.65rem] uppercase tracking-[0.15em] text-white/30">
-            {micState === "on"
-              ? "reacting to your audio — make some noise"
-              : "running on a synth beat · turn on the mic to react to sound"}
-          </p>
-        </div>
+          <div className="pointer-events-auto mt-9 flex flex-wrap items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={() => toggleSource("mic")}
+              aria-pressed={source === "mic"}
+              className={`rounded-full border px-6 py-3 font-mono text-xs uppercase tracking-[0.15em] backdrop-blur-sm transition-all ${
+                source === "mic"
+                  ? "border-accent bg-accent/20 text-accent hover:bg-accent/30"
+                  : "border-accent/40 bg-accent/10 text-accent hover:border-accent/70 hover:bg-accent/20"
+              }`}
+            >
+              {source === "mic"
+                ? "● mic on — tap to turn off"
+                : error === "mic"
+                  ? "mic blocked — tap to retry"
+                  : "▶ turn on mic"}
+            </button>
 
-        {/* footer */}
-        <div className="flex items-center justify-center p-6 sm:p-10">
-          <span className="font-mono text-xs uppercase tracking-[0.2em] text-white/35">
-            Three.js · GLSL · Web Audio
-          </span>
+            <button
+              type="button"
+              onClick={() => toggleSource("browser")}
+              aria-pressed={source === "browser"}
+              className={`rounded-full border px-6 py-3 font-mono text-xs uppercase tracking-[0.15em] backdrop-blur-sm transition-all ${
+                source === "browser"
+                  ? "border-accent bg-accent/20 text-accent hover:bg-accent/30"
+                  : "border-accent/40 bg-accent/10 text-accent hover:border-accent/70 hover:bg-accent/20"
+              }`}
+            >
+              {source === "browser"
+                ? "● browser audio on — tap to turn off"
+                : error === "browser"
+                  ? "no tab audio — tap to retry"
+                  : "▶ turn on browser audio"}
+            </button>
+          </div>
+          <p className="mt-3 max-w-sm font-mono text-[0.65rem] uppercase tracking-[0.15em] text-white/30">
+            {source === "mic"
+              ? "reacting to your mic — make some noise"
+              : source === "browser"
+                ? "reacting to browser audio — play a track in another tab"
+                : "running on a fluid flow · turn on mic or browser audio to react"}
+          </p>
         </div>
       </div>
     </main>
